@@ -218,7 +218,7 @@ class EncodePanel(QWidget):
         existing = [
             output_stem(s) + preset['ext']
             for s in self._sequences
-            if (Path(s.folder) / f"{output_stem(s)}{preset['ext']}").exists()
+            if (Path(s.folder).parent / f"{output_stem(s)}{preset['ext']}").exists()
         ]
         n = len(self._sequences)
         if existing:
@@ -260,7 +260,7 @@ class EncodePanel(QWidget):
         self._tasks = [
             EncodeTask(
                 seq=seq,
-                out_path=Path(seq.folder) / f"{output_stem(seq)}{preset['ext']}",
+                out_path=Path(seq.folder).parent / f"{output_stem(seq)}{preset['ext']}",
                 fps=fps,
                 preset=preset,
                 gamma_fix=gamma_fix,
@@ -352,6 +352,11 @@ class EncodePanel(QWidget):
         self._encode_btn.setStyleSheet(self._style_btn_encode())
         self._encode_btn.setEnabled(True)
         self._back_btn.setEnabled(True)
+
+        if self._success_count > 0 and self._tasks:
+            import subprocess
+            out_dir = str(self._tasks[0].out_path.parent)
+            subprocess.Popen(["explorer", out_dir])
 
     def cleanup(self):
         if self._worker is not None:

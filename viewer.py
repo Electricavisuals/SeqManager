@@ -27,6 +27,7 @@ def load_frame_qimage(path: str, max_height: int) -> QImage:
         if ext == '.exr':
             return _load_exr_qimage(path, max_height)
         from PIL import Image
+        import numpy as np
         img = Image.open(path).convert('RGB')
         w, h = img.size
         if h > max_height:
@@ -36,10 +37,24 @@ def load_frame_qimage(path: str, max_height: int) -> QImage:
             if factor > 1:
                 img = img.reduce(factor)
                 w, h = img.size
-            img = img.resize((int(w * max_height / h), max_height), Image.BILINEAR)
-        data = img.tobytes('raw', 'RGB')
-        return QImage(bytes(data), img.width, img.height, img.width * 3, QImage.Format_RGB888).copy()
+            img = img.resize((int(w * max_height / h), max_height),
+                             getattr(Image, 'Resampling', Image).BILINEAR)
+        arr = np.array(img, dtype=np.uint8)
+        rh, rw = arr.shape[:2]
+        bgra = np.empty((rh, rw, 4), dtype=np.uint8)
+        bgra[:, :, 0] = arr[:, :, 2]
+        bgra[:, :, 1] = arr[:, :, 1]
+        bgra[:, :, 2] = arr[:, :, 0]
+        bgra[:, :, 3] = 255
+        return QImage(bytes(bgra.tobytes()), rw, rh, rw * 4, QImage.Format_ARGB32).copy()
     except Exception:
+        try:
+            import traceback, datetime
+            log = Path.home() / "seqmanager_error.log"
+            with open(log, 'a', encoding='utf-8') as f:
+                f.write(f"\n{datetime.datetime.now()}  {path}\n{traceback.format_exc()}\n")
+        except Exception:
+            pass
         return _placeholder_qimage(max_height)
 
 
@@ -210,6 +225,12 @@ class SequenceItem(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
 
+        self._thumb_lbl = QLabel()
+        self._thumb_lbl.setFixedSize(72, 40)
+        self._thumb_lbl.setStyleSheet("background-color: #0a0a10;")
+        self._thumb_lbl.setAlignment(Qt.AlignCenter)
+        row.addWidget(self._thumb_lbl)
+
         res = f"  {seq.resolution[0]}x{seq.resolution[1]}" if seq.resolution else ""
         subfolder = Path(seq.folder).name
         # Detect if an output video already exists
@@ -223,7 +244,7 @@ class SequenceItem(QWidget):
         self._label = QLabel(
             f"{subfolder}/\n{seq.name}{seq.extension}\n{len(seq.frames)} frames{res}{done_tag}"
         )
-        self._label.setContentsMargins(12, 6, 4, 6)
+        self._label.setContentsMargins(4, 4, 4, 4)
         self._label.setMouseTracking(True)
         row.addWidget(self._label, 1)
 
@@ -266,17 +287,20 @@ class SequenceItem(QWidget):
         if active:
             self._label.setStyleSheet(
                 "color: #a8d8ea; background-color: #1e2e3a;"
-                "border-left: 2px solid #3a6e87; padding-left: 10px;"
+                "border-left: 2px solid #3a6e87; padding-left: 4px;"
             )
         else:
             color = "#5a8a5a" if self._output_exists else "#9a9aaa"
             self._label.setStyleSheet(
                 f"color: {color}; background-color: transparent;"
-                "border-left: 2px solid transparent; padding-left: 10px;"
+                "border-left: 2px solid transparent; padding-left: 4px;"
             )
 
     def set_active(self, active: bool):
         self._set_style(active)
+
+    def set_thumb(self, pix: QPixmap):
+        self._thumb_lbl.setPixmap(pix.scaled(72, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def set_progress(self, loaded: int, total: int):
         self._bar.setValue(loaded)
@@ -386,6 +410,8 @@ class ThumbnailPanel(QWidget):
         self._seq = None
         self._cache = {}
         self._frame_idx = 0
+        self.setStyleSheet("background-color: #0e0e14;")
+        self.setAutoFillBackground(True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -457,6 +483,12 @@ class ThumbnailPanel(QWidget):
         if idx == 0 and self._frame_idx == 0:
             self._show_frame(0)
             self._ensure_autoplay()
+            QTimer.singleShot(30, self._force_repaint)
+
+    def _force_repaint(self):
+        self._img_label.repaint()
+        if self.window():
+            self.window().update()
 
     def show_frame_at_x(self, x: int, window_width: int):
         if not self._seq or self._paused:
@@ -550,6 +582,9 @@ class ThumbnailPanel(QWidget):
         if not self._seq or idx not in self._cache:
             return
         self._img_label.setPixmap(self._cache[idx])
+        self._img_label.repaint()
+        if idx == 0:
+            QApplication.processEvents()
         self._frame_idx = idx
         if not self._paused:
             n = self._seq.frame_numbers[idx]
@@ -705,7 +740,7 @@ class SeqWindow(QWidget):
         self._config_dlg = None
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+
         self.setMouseTracking(True)
         self.setStyleSheet("""
             QWidget {
@@ -749,7 +784,7 @@ class SeqWindow(QWidget):
 
         # ── Left panel ──────────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(210)
+        left.setFixedWidth(280)
         left.setStyleSheet("background-color: #16161e; border-right: 1px solid #2a2a38;")
         left.setMouseTracking(True)
 
@@ -892,9 +927,23 @@ class SeqWindow(QWidget):
 
         QApplication.instance().installEventFilter(self)
 
-        # 1) Load frame 0 of each sequence quickly, then start full buffers
+        max_h = config.get('max_height', 200)
+
+        # Sync: load frame 0 of first sequence before window shows
+        if self._sequences:
+            first = self._sequences[0]
+            key = self._seq_key(first)
+            self._caches[key] = {}
+            pix0 = QPixmap.fromImage(load_frame_qimage(first.frames[0], max_h))
+            self._caches[key][0] = pix0
+            item0 = self._item_for_seq_key(key)
+            if item0:
+                item0.set_thumb(pix0)
+                item0.set_progress(1, len(first.frames))
+
+        # Async: load frame 0 of remaining sequences, then all frames
         self._preview_loader = PreviewLoader(
-            self._sequences, config.get('max_height', 200), self
+            self._sequences[1:], max_h, self
         )
         self._preview_loader.frame_ready.connect(self._on_preview_frame)
         self._preview_loader.all_done.connect(self._start_all_loaders)
@@ -915,6 +964,7 @@ class SeqWindow(QWidget):
         item = self._item_for_seq_key(key)
         if item:
             item.set_progress(1, len(seq.frames))
+            item.set_thumb(pix)
         if key == self._current_key:
             self._thumb.on_frame_added(0)
 
